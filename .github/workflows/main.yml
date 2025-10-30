@@ -1,0 +1,77 @@
+app:
+  name: WeReadBot
+  startup_mode: scheduled
+  startup_delay: 60-300
+curl_config:
+  content: |-
+    curl 'https://weread.qq.com/web/book/read' \
+      -X POST \
+      -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:143.0) Gecko/20100101 Firefox/143.0' \
+      -H 'Accept: application/json, text/plain, */*' \
+      -H 'Accept-Language: zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2' \
+      -H 'Accept-Encoding: gzip, deflate, br, zstd' \
+      -H 'Content-Type: application/json;charset=utf-8' \
+      -H 'x-wrpa-0: a76a97e88d8821a501f4413186ae3f6a7b2e77f9af77f22aee502de3b18103d54f3ddb78203cb4ea43a06d23062024e95823864a4a99757ce6288070332da18e,MyhIMlQqQTZlVsOzRMKow7gXNigcwpnCt8OxYMKNOcOIV8Omf8KLQcKww67CmsK/w7Ygf8OLw5HDn8OPwrlDw75AUGNswqfCpn5Pwp3CocKOUirDlMOTw6g7w5fCpcKvw4g3w5bCisKSwpJ7ITNDBMKwwpBSUsKzXsO2w4c+HFkvFMKiwptpRMKKwrbDuxYrw73DucOoIsKjwrTDncOEw7E9e8Orw5/CtsKMesO/woLDkAQCXxFVAybDrsOfwrANw6kWw4TCsHcYw5MZw7nDr14bYMOyEMOme8KhwoRjw4DCpBgWb8Kww6Zew7Iuw43CvCVdBlDCu8K8cAZqRcOxVsKSwqHDjR/CicKoHcOSHmluasKjPMKdw5bCqi3Dr3oQw7vCqXNjw65rwq9XGhA6BMOLbgbDssOYN8OtfAvCrcOOw7HCqkrDuMOZPkNZaMK8TVBtwpPCrsKPUsK6w7HDtFPCin4MWSnDmFXDlVrDgsKSw5wawp3DvMK2eVzDom/C,kH58CxDCszXCsMKhPhjDqsOVNcKkwrvClnjClMOIwqx1wrfDphJsw5PCiFrDgsKNwoTCqsKNwpfCuQtFwonClsKsw5/CuTduw5/DvsKRO8KSwrsoDcKkQMKzGcKPw6zCkMKqw6PCr2hqNcKCDU47Fl5vW0DDkMKCw5vDh8OHw68RR8KR' \
+      -H 'sentry-trace: 533d40f806bf47f2a2adbfb6e4ea2153-b2e7e90326d567e0' \
+      -H 'baggage: sentry-environment=production,sentry-release=dev-1760449839699,sentry-public_key=ed67ed71f7804a038e898ba54bd66e44,sentry-trace_id=533d40f806bf47f2a2adbfb6e4ea2153' \
+      -H 'Origin: https://weread.qq.com' \
+      -H 'Connection: keep-alive' \
+      -H 'Referer: https://weread.qq.com/web/reader/8e5326b07153adcf8e53d42keb632a20326aeb6fdc366f6' \
+      -H 'Cookie: wr_gid=248724462; wr_fp=3530485527; wr_skey=jrVo_M1Z; wr_vid=362414740; wr_ql=0; wr_rt=web%40WMz10NIGa_EdU0YvblE_AL; wr_localvid=448321e08159a029444833a; wr_name=%E5%B8%83%E5%92%95; wr_avatar=https%3A%2F%2Fthirdwx.qlogo.cn%2Fmmopen%2Fvi_32%2FicFicCsbjdIAR5Yv6yBhaNrKcLYoPTmicawicWJick9c0UVo1DcsLPuRH2Giahmkn6dBiboa4tiagnkgibGWsp1icdd75uNucNHmS6sFbEm3R4IOfuic8o%2F132; wr_gender=0; wr_pf=undefined' \
+      -H 'Sec-Fetch-Dest: empty' \
+      -H 'Sec-Fetch-Mode: cors' \
+      -H 'Sec-Fetch-Site: same-origin' \
+      -H 'TE: trailers' \
+      --data-raw $'{"appId":"wb1557943h1555362885","b":"8e5326b07153adcf8e53d42","c":"eb632a20326aeb6fdc366f6","ci":618,"co":8002,"sm":"\u9648\u5e73\u5b89\u4f9d\u65e7\u5750\u5728\u90a3\u6761\u957f\u51f3\u4e0a\uff0c\u90a3\u5f20\u6446\u5728\u51f3\u4e0a\u7684","pr":30,"rt":149,"ts":1761831543711,"rn":272,"sg":"1361111bbe9c43f87a84fa9f50c9db864112d3cfaf05cec27f4da3140729da3e","ct":1761831543,"ps":"94e322307a7ff3d3g0193b0","pc":"81c320907a7ff3d4g01058a","s":"11b60f3e"}'
+reading:
+  mode: smart_random
+  target_duration: 45-90
+  reading_interval: 30-48
+  use_curl_data_first: true
+  fallback_to_config: true
+  smart_random:
+    book_continuity: 0.8
+    chapter_continuity: 0.7
+    book_switch_cooldown: 300
+  books:
+    - name: 明朝那些事
+      book_id: a57325c05c8ed3a57224187
+      chapters:
+        - chapter_id: a87322c014a87ff679a21ea
+        - chapter_id: '4'
+human_simulation:
+  enabled: true
+  reading_speed_variation: true
+  break_probability: 0.1
+  break_duration: 5-20
+  rotate_user_agent: false
+network:
+  timeout: 30
+  retry_times: 3
+  retry_delay: 5-15
+  rate_limit: 10
+notification:
+  enabled: true
+  include_statistics: true
+  channels:
+    - name: wxpusher
+      enabled: true
+      config:
+        spt: AT_DXIa6fsea4wVJtXwXO21ZAqij9LOjpM2
+schedule:
+  enabled: true
+  cron_expression: 0 */6 * * *
+  timezone: Asia/Shanghai
+daemon:
+  enabled: true
+  session_interval: 120-180
+  max_daily_sessions: 12
+hack:
+  cookie_refresh_ql: false
+logging:
+  level: INFO
+  format: detailed
+  file: logs/weread.log
+  max_size: 10MB
+  backup_count: 5
+  console: true
