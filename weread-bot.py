@@ -4,7 +4,7 @@
 
 项目信息:
     名称: WeRead Bot
-    版本: 0.3.2
+    版本: 0.3.5
     作者: funnyzak
     仓库: https://github.com/funnyzak/weread-bot
     许可: MIT License
@@ -61,7 +61,7 @@ import httpx
 from croniter import croniter
 from zoneinfo import ZoneInfo
 
-VERSION = "0.3.2"
+VERSION = "0.3.5"
 REPO = "https://github.com/funnyzak/weread-bot"
 
 
