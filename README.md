@@ -98,6 +98,8 @@ vim multiuser-config.yaml
 python weread-bot.py --config multiuser-config.yaml
 ```
 
+> - 也可以设置 `WEREAD_CURL_STRING`，用至少两个空行分隔多段 curl，每段对应一个用户；名称将自动生成为 `env_user_1` 等。
+
 ### 方式四：GitHub Actions 云端运行
 
 ```bash
@@ -178,7 +180,7 @@ open config-generator.html
 
 ### 多用户配置
 
-支持通过配置文件配置多个用户的CURL命令和个性化参数，适合需要同时管理多个微信读书账号的场景。
+支持通过配置文件配置多个用户的CURL命令和个性化参数，适合需要同时管理多个微信读书账号的场景。若无法写入文件（如 GitHub Actions Secrets），可使用 `WEREAD_CURL_STRING` 放置多段 curl，每段之间至少留出 **两个空行**，程序会自动拆分为多个用户（名称自动生成）。
 
 | 配置项 | 配置文件路径 | 说明 |
 |--------|-------------|------|

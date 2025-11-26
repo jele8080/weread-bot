@@ -1002,8 +1002,7 @@ class ConfigManager:
     def _load_user_configs(self, config_data: dict) -> List[UserConfig]:
         """加载用户配置"""
         users = []
-
-        # 从YAML配置加载
+        # 1) YAML 配置（优先）
         users_config = self._get_nested_dict_value(
             config_data, "curl_config.users"
         )
@@ -1020,6 +1019,28 @@ class ConfigManager:
                     )
                     users.append(user)
                     logging.info(f"✅ 已加载用户配置: {user.name}")
+
+        # 2) 回退：WEREAD_CURL_STRING 按“至少两个空行”拆分为多用户
+        if not users:
+            curl_env = os.getenv("WEREAD_CURL_STRING", "")
+            if curl_env:
+                import re
+                segments = [seg.strip() for seg in re.split(r'(?:\r?\n\s*){2,}', curl_env) if seg.strip()]
+                if len(segments) > 1:
+                    for idx, seg in enumerate(segments, start=1):
+                        users.append(UserConfig(
+                            name=f"env_user_{idx}",
+                            content=seg
+                        ))
+                    logging.info(
+                        f"✅ 已从 WEREAD_CURL_STRING 拆分出 {len(users)} 个用户配置（需至少两行空行分隔）"
+                    )
+                elif segments:
+                    # 只有一个片段，仍然按单用户处理
+                    users.append(UserConfig(
+                        name="env_user_1",
+                        content=segments[0]
+                    ))
 
         return users
 
