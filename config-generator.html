@@ -129,6 +129,14 @@
                                     <p class="text-xs text-gray-500 mt-1">支持范围值，如 60-300 表示60到300秒随机，防止被识别，建议尽量设置大一些</p>
                                 </div>
 
+                                <!-- Max Concurrent Users -->
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-2">最大并发用户数</label>
+                                    <input type="number" id="maxConcurrentUsers" value="1" min="1"
+                                           class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+                                    <p class="text-xs text-gray-500 mt-1">多用户模式下同时执行的账号数量，推荐 1-3 之间，根据服务器性能和风控策略调优</p>
+                                </div>
+
                                 <!-- CURL Configuration -->
                                 <div>
                                     <label class="block text-sm font-medium text-gray-700 mb-2">CURL配置方式</label>
@@ -912,6 +920,7 @@ app:
   name: WeReadBot
   startup_mode: immediate
   startup_delay: 1-10
+  max_concurrent_users: 1
 
 curl_config:
   file_path: curl_command.txt
@@ -1084,6 +1093,11 @@ notification:
                     const startupDelay = document.getElementById('startupDelay').value.trim();
                     if (!startupDelay || !isValidRange(startupDelay)) {
                         errors.push('启动延迟格式不正确，应为范围值（如：1-10）或单值');
+                    }
+
+                    const maxConcurrent = parseInt(document.getElementById('maxConcurrentUsers').value);
+                    if (isNaN(maxConcurrent) || maxConcurrent < 1) {
+                        errors.push('最大并发用户数必须为大于等于1的整数');
                     }
 
                     // Validate CURL configuration
@@ -1507,7 +1521,8 @@ notification:
                 app: {
                     name: document.getElementById('appName').value,
                     startup_mode: document.getElementById('startupMode').value,
-                    startup_delay: document.getElementById('startupDelay').value
+                    startup_delay: document.getElementById('startupDelay').value,
+                    max_concurrent_users: parseInt(document.getElementById('maxConcurrentUsers').value) || 1
                 },
                 curl_config: {},
                 reading: {
@@ -1731,6 +1746,7 @@ notification:
             // Load example configuration
             document.getElementById('startupMode').value = 'immediate';
             document.getElementById('startupDelay').value = '60-300';
+            document.getElementById('maxConcurrentUsers').value = '1';
             document.getElementById('curlFilePath').value = 'curl_command.txt';
             document.getElementById('readingMode').value = 'smart_random';
             document.getElementById('targetDuration').value = '45-90';

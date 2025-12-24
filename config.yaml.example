@@ -8,6 +8,8 @@ app:
   startup_mode: "immediate"
   # 单位（秒），启动随机延迟，随机启动时间，防止被识别，建议尽量设置大一些
   startup_delay: "60-300"
+  # 多用户模式下最大并发执行的用户数量，默认1表示顺序执行
+  max_concurrent_users: 1
 
 # CURL配置（支持单用户和多用户模式）
 curl_config:
@@ -87,8 +89,8 @@ human_simulation:
 network:
   timeout: 30
   retry_times: 3
-  retry_delay: "5-15"  # 重试延迟（秒）
-  # 请求频率控制（请求/分钟）
+  retry_delay: "5-15"  # 重试延迟（秒），将在异步退避中使用
+  # 请求频率控制（请求/分钟），会被速率限制器严格执行
   rate_limit: 10
 
 # 通知配置
@@ -252,5 +254,3 @@ logging:
   backup_count: 5
   # 是否在控制台显示
   console: true
-
-

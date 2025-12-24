@@ -4,7 +4,7 @@
 
 项目信息:
     名称: WeRead Bot
-    版本: 0.3.1
+    版本: 0.3.5
     作者: funnyzak
     仓库: https://github.com/funnyzak/weread-bot
     许可: MIT License
@@ -50,18 +50,18 @@ import signal
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 from dataclasses import dataclass, field
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 
 import yaml
 import requests
-import schedule
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import httpx
+from croniter import croniter
+from zoneinfo import ZoneInfo
 
-VERSION = "0.3.1"
+VERSION = "0.3.5"
 REPO = "https://github.com/funnyzak/weread-bot"
 
 
@@ -218,6 +218,7 @@ class WeReadConfig:
     version: str = VERSION
     startup_mode: str = "immediate"
     startup_delay: str = "1-10"
+    max_concurrent_users: int = 1
 
     # CURL 配置（单用户模式）
     curl_file_path: str = ""
@@ -264,6 +265,7 @@ class WeReadConfig:
   📊 目标时长: {self.reading.target_duration} 分钟
   🔄 阅读间隔: {self.reading.reading_interval} 秒
   🎭 人类模拟: {'启用' if self.human_simulation.enabled else '禁用'}
+  👥 最大并发用户: {self.max_concurrent_users}
 
 网络配置:
   ⏱️  超时时间: {self.network.timeout} 秒
@@ -422,6 +424,10 @@ class ConfigManager:
             startup_delay=self._get_config_value(
                 config_data, "app.startup_delay", "STARTUP_DELAY", "1-10"
             ),
+            max_concurrent_users=int(self._get_config_value(
+                config_data, "app.max_concurrent_users",
+                "MAX_CONCURRENT_USERS", "1"
+            )),
             curl_file_path=self._get_config_value(
                 config_data, "curl_config.file_path",
                 "WEREAD_CURL_BASH_FILE_PATH", ""
@@ -582,6 +588,7 @@ class ConfigManager:
             ),
         )
 
+        config.max_concurrent_users = max(1, config.max_concurrent_users)
         return config
 
     def _load_books(self, config_data: dict) -> List[BookInfo]:
@@ -995,8 +1002,7 @@ class ConfigManager:
     def _load_user_configs(self, config_data: dict) -> List[UserConfig]:
         """加载用户配置"""
         users = []
-
-        # 从YAML配置加载
+        # 1) YAML 配置（优先）
         users_config = self._get_nested_dict_value(
             config_data, "curl_config.users"
         )
@@ -1013,6 +1019,28 @@ class ConfigManager:
                     )
                     users.append(user)
                     logging.info(f"✅ 已加载用户配置: {user.name}")
+
+        # 2) 回退：WEREAD_CURL_STRING 按“至少两个空行”拆分为多用户
+        if not users:
+            curl_env = os.getenv("WEREAD_CURL_STRING", "")
+            if curl_env:
+                import re
+                segments = [seg.strip() for seg in re.split(r'(?:\r?\n\s*){2,}', curl_env) if seg.strip()]
+                if len(segments) > 1:
+                    for idx, seg in enumerate(segments, start=1):
+                        users.append(UserConfig(
+                            name=f"env_user_{idx}",
+                            content=seg
+                        ))
+                    logging.info(
+                        f"✅ 已从 WEREAD_CURL_STRING 拆分出 {len(users)} 个用户配置（需至少两行空行分隔）"
+                    )
+                elif segments:
+                    # 只有一个片段，仍然按单用户处理
+                    users.append(UserConfig(
+                        name="env_user_1",
+                        content=segments[0]
+                    ))
 
         return users
 
@@ -1040,6 +1068,29 @@ class RandomHelper:
     def get_random_int_from_range(range_str: str) -> int:
         """从范围字符串获取随机整数"""
         return int(RandomHelper.get_random_from_range(range_str))
+
+
+class RateLimiter:
+    """简单的异步速率限制器，按请求/分钟限制"""
+
+    def __init__(self, rate_limit: int):
+        self.rate_limit = max(0, rate_limit)
+        self._interval = (60.0 / self.rate_limit) if self.rate_limit > 0 else 0
+        self._lock = asyncio.Lock()
+        self._last_acquire = 0.0
+
+    async def acquire(self):
+        """按需等待确保不超过速率"""
+        if self.rate_limit <= 0:
+            return
+
+        async with self._lock:
+            now = time.monotonic()
+            wait_time = self._interval - (now - self._last_acquire)
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+                now = time.monotonic()
+            self._last_acquire = now
 
 
 class CurlParser:
@@ -1179,55 +1230,72 @@ class CurlParser:
 
 
 class HttpClient:
-    """HTTP客户端封装"""
+    """异步HTTP客户端封装，内置重试与速率限制"""
 
     def __init__(self, config: NetworkConfig):
         self.config = config
-        self.session = requests.Session()
-        self._setup_session()
-        self.request_times = []
-
-    def _setup_session(self):
-        """设置HTTP会话"""
-        # 设置重试策略
-        retry_strategy = Retry(
-            total=self.config.retry_times,
-            status_forcelist=[429, 500, 502, 503, 504],
-            backoff_factor=1
+        self.request_times: List[float] = []
+        self._rate_limiter = RateLimiter(config.rate_limit)
+        self._client = httpx.AsyncClient(
+            timeout=config.timeout,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=20)
         )
 
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
+    async def close(self):
+        await self._client.aclose()
 
-        # 设置超时
-        self.session.timeout = self.config.timeout
-
-    def post_json(
+    async def post_json(
         self, url: str, data: dict, headers: dict, cookies: dict
     ) -> Tuple[dict, float]:
-        """发送JSON POST请求"""
-        start_time = time.time()
+        response, elapsed = await self._request_with_retries(
+            url, headers=headers, cookies=cookies, json_data=data
+        )
+        return response.json(), elapsed
 
-        try:
-            response = self.session.post(
-                url,
-                data=json.dumps(data, separators=(',', ':')),
-                headers=headers,
-                cookies=cookies,
-                timeout=self.config.timeout
-            )
+    async def post_raw(
+        self, url: str, headers: dict = None, cookies: dict = None,
+        json_data: dict = None, data: Any = None
+    ) -> Tuple[httpx.Response, float]:
+        return await self._request_with_retries(
+            url, headers=headers, cookies=cookies,
+            json_data=json_data, data=data
+        )
 
-            response_time = time.time() - start_time
-            self.request_times.append(response_time)
+    async def _request_with_retries(
+        self, url: str, headers: dict = None, cookies: dict = None,
+        json_data: dict = None, data: Any = None
+    ) -> Tuple[httpx.Response, float]:
+        attempts = max(1, self.config.retry_times)
+        last_error = None
 
-            response.raise_for_status()
-            return response.json(), response_time
+        for attempt in range(attempts):
+            start_time = time.time()
+            try:
+                await self._rate_limiter.acquire()
+                response = await self._client.post(
+                    url,
+                    headers=headers,
+                    cookies=cookies,
+                    json=json_data,
+                    data=data
+                )
+                response.raise_for_status()
+                elapsed = time.time() - start_time
+                self.request_times.append(elapsed)
+                return response, elapsed
+            except Exception as exc:
+                elapsed = time.time() - start_time
+                self.request_times.append(elapsed)
+                last_error = exc
+                if attempt < attempts - 1:
+                    delay = RandomHelper.get_random_from_range(
+                        self.config.retry_delay
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    break
 
-        except Exception as e:
-            response_time = time.time() - start_time
-            self.request_times.append(response_time)
-            raise e
+        raise last_error if last_error else RuntimeError("请求失败")
 
     def get_average_response_time(self) -> float:
         """获取平均响应时间"""
@@ -1622,6 +1690,10 @@ class NotificationService:
 
         logging.info(f"📊 通知发送完成: {success_count}/{total_channels} 个通道成功")
         return success_count > 0
+
+    async def send_notification_async(self, message: str) -> bool:
+        """在线程池中异步发送通知，避免阻塞事件循环"""
+        return await asyncio.to_thread(self.send_notification, message)
 
     def _send_notification_to_channel(
         self, message: str, channel: NotificationChannel
@@ -2039,94 +2111,12 @@ class NotificationService:
         return self._send_http_notification(url, data, "PushDeer")
 
 
-class CronParser:
-    """Cron表达式解析器"""
-
-    @staticmethod
-    def parse_cron_to_schedule(cron_expression: str) -> bool:
-        """将cron表达式转换为schedule调度"""
-        # 简化的cron解析，支持基本格式：分 时 日 月 周
-        # 例如: "0 */2 * * *" 表示每2小时执行一次
-        # 支持多时间点: "30 9,18 * * *" 表示每天9:30和18:30执行
-        parts = cron_expression.strip().split()
-        if len(parts) != 5:
-            logging.error(f"❌ 无效的cron表达式: {cron_expression}")
-            return False
-
-        minute, hour, day, month, weekday = parts
-
-        try:
-            # 处理每小时执行
-            if hour.startswith("*/"):
-                interval = int(hour[2:])
-                schedule.every(interval).hours.do(
-                    lambda: asyncio.create_task(
-                        WeReadApplication.run_single_session()
-                    )
-                )
-                logging.info(f"✅ 已设置定时任务: 每{interval}小时执行一次")
-                return True
-
-            # 处理多时间点执行 (如: 30 9,18 * * *)
-            elif "," in hour and minute.isdigit():
-                hours = [h.strip() for h in hour.split(",")]
-                valid_hours = []
-                
-                for h in hours:
-                    if h.isdigit() and 0 <= int(h) <= 23:
-                        valid_hours.append(int(h))
-                    else:
-                        logging.warning(f"⚠️ 跳过无效小时: {h}")
-                
-                if valid_hours:
-                    for h in valid_hours:
-                        time_str = f"{h:02d}:{minute.zfill(2)}"
-                        schedule.every().day.at(time_str).do(
-                            lambda t=time_str: asyncio.create_task(
-                                WeReadApplication.run_single_session()
-                            )
-                        )
-                    logging.info(f"✅ 已设置定时任务: 每天{', '.join([f'{h:02d}:{minute}' for h in valid_hours])}执行")
-                    return True
-                else:
-                    logging.error(f"❌ 没有有效的小时时间点: {hour}")
-                    return False
-
-            # 处理固定时间执行
-            elif hour.isdigit() and minute.isdigit():
-                time_str = f"{hour.zfill(2)}:{minute.zfill(2)}"
-                schedule.every().day.at(time_str).do(
-                    lambda: asyncio.create_task(
-                        WeReadApplication.run_single_session()
-                    )
-                )
-                logging.info(f"✅ 已设置定时任务: 每天{time_str}执行")
-                return True
-
-            # 处理每天执行
-            elif hour == "*" and minute.isdigit():
-                schedule.every().hour.at(f":{minute.zfill(2)}").do(
-                    lambda: asyncio.create_task(
-                        WeReadApplication.run_single_session()
-                    )
-                )
-                logging.info(f"✅ 已设置定时任务: 每小时第{minute}分钟执行")
-                return True
-
-        except Exception as e:
-            logging.error(f"❌ cron表达式解析失败: {e}")
-            return False
-
-        logging.error(f"❌ 不支持的cron表达式格式: {cron_expression}")
-        return False
-
-
 class WeReadApplication:
     """微信读书应用程序管理器"""
 
     _instance = None
     _shutdown_requested = False
-    _current_session_manager = None
+    _current_session_managers: Set["WeReadSessionManager"] = set()
     _daily_session_count = 0
     _last_session_date = None
 
@@ -2158,8 +2148,10 @@ class WeReadApplication:
             WeReadApplication._shutdown_requested = True
 
             # 如果当前有会话在运行，尝试等待其完成
-            if WeReadApplication._current_session_manager:
-                logging.info("⏳ 等待当前阅读会话完成...")
+            if WeReadApplication._current_session_managers:
+                logging.info(
+                    f"⏳ 正在等待 {len(WeReadApplication._current_session_managers)} 个会话完成..."
+                )
                 # 这里可以添加更复杂的会话中断逻辑
 
     async def run(self):
@@ -2188,19 +2180,49 @@ class WeReadApplication:
             logging.error("❌ 定时模式已启用，但schedule配置未启用")
             return
 
-        # 解析cron表达式并设置调度
-        if not CronParser.parse_cron_to_schedule(
-            self.config.schedule.cron_expression
-        ):
-            logging.error("❌ 定时任务设置失败")
+        timezone_name = self.config.schedule.timezone or "Asia/Shanghai"
+        try:
+            tz = ZoneInfo(timezone_name)
+        except Exception:
+            logging.error(f"❌ 无效的时区配置: {timezone_name}")
             return
 
-        logging.info("⏰ 定时任务已启动，等待执行时间...")
+        try:
+            cron_iter = croniter(
+                self.config.schedule.cron_expression,
+                datetime.now(tz)
+            )
+        except Exception as e:
+            logging.error(f"❌ 无效的cron表达式: {e}")
+            return
 
-        # 运行调度器
+        logging.info(
+            f"⏰ 定时任务已启动 (时区 {timezone_name})，表达式: {self.config.schedule.cron_expression}"
+        )
+
         while not WeReadApplication._shutdown_requested:
-            schedule.run_pending()
-            await asyncio.sleep(1)
+            next_run = cron_iter.get_next(datetime)
+            if next_run.tzinfo is None:
+                next_run = next_run.replace(tzinfo=tz)
+            now = datetime.now(tz)
+            wait_seconds = (next_run - now).total_seconds()
+
+            if wait_seconds <= 0:
+                continue
+
+            logging.info(
+                f"🗓️ 下一次执行时间: {next_run.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S %Z')}"
+            )
+
+            while wait_seconds > 0 and not WeReadApplication._shutdown_requested:
+                await asyncio.sleep(min(wait_seconds, 1))
+                now = datetime.now(tz)
+                wait_seconds = (next_run - now).total_seconds()
+
+            if WeReadApplication._shutdown_requested:
+                break
+
+            await self.run_single_session()
 
         logging.info("👋 定时任务已停止")
 
@@ -2291,7 +2313,7 @@ class WeReadApplication:
         try:
             # 创建会话管理器
             session_manager = WeReadSessionManager(instance.config)
-            WeReadApplication._current_session_manager = session_manager
+            WeReadApplication._current_session_managers.add(session_manager)
 
             # 执行阅读会话
             session_stats = await session_manager.start_reading_session()
@@ -2309,79 +2331,100 @@ class WeReadApplication:
                 notification_service = NotificationService(
                     instance.config.notification
                 )
-                notification_service.send_notification(error_msg)
+                await notification_service.send_notification_async(
+                    error_msg
+                )
             except Exception:
                 pass
         finally:
-            WeReadApplication._current_session_manager = None
+            WeReadApplication._current_session_managers.discard(session_manager)
 
     @classmethod
     async def _run_multi_user_sessions(cls, instance):
         """执行多用户会话"""
-        logging.info(f"🎭 检测到多用户配置，共 {len(instance.config.users)} 个用户")
+        user_count = len(instance.config.users)
+        logging.info(f"🎭 检测到多用户配置，共 {user_count} 个用户")
+
+        concurrency = max(1, instance.config.max_concurrent_users)
+        if concurrency > user_count:
+            concurrency = user_count
+        logging.info(f"⚙️  最大并发用户数: {concurrency}")
+
+        semaphore = asyncio.Semaphore(concurrency)
+        tasks = []
+
+        async def run_for_user(user_config: UserConfig):
+            if WeReadApplication._shutdown_requested:
+                logging.info("📡 收到关闭信号，跳过后续用户")
+                return None
+
+            async with semaphore:
+                if WeReadApplication._shutdown_requested:
+                    return None
+
+                logging.info(f"👤 开始执行用户 {user_config.name} 的阅读会话")
+                session_manager = WeReadSessionManager(
+                    instance.config, user_config
+                )
+                WeReadApplication._current_session_managers.add(session_manager)
+
+                try:
+                    session_stats = await session_manager.start_reading_session()
+                    logging.info(f"📊 用户 {user_config.name} 会话统计:")
+                    logging.info(session_stats.get_statistics_summary())
+                    return {
+                        "name": user_config.name,
+                        "stats": session_stats,
+                        "success": True
+                    }
+                except Exception as e:
+                    error_msg = (
+                        f"❌ 用户 {user_config.name} 阅读会话执行失败: {e}"
+                    )
+                    logging.error(error_msg)
+                    try:
+                        notification_service = NotificationService(
+                            instance.config.notification
+                        )
+                        await notification_service.send_notification_async(
+                            error_msg
+                        )
+                    except Exception:
+                        pass
+                    return {
+                        "name": user_config.name,
+                        "stats": None,
+                        "success": False
+                    }
+                finally:
+                    WeReadApplication._current_session_managers.discard(
+                        session_manager
+                    )
+
+        for user_config in instance.config.users:
+            tasks.append(asyncio.create_task(run_for_user(user_config)))
 
         all_session_stats = []
         successful_users = []
         failed_users = []
 
-        for user_config in instance.config.users:
-            if WeReadApplication._shutdown_requested:
-                logging.info("📡 收到关闭信号，停止多用户会话")
-                break
-
-            try:
-                logging.info(f"👤 开始执行用户 {user_config.name} 的阅读会话")
-
-                # 创建用户特定的会话管理器
-                session_manager = WeReadSessionManager(
-                    instance.config, user_config
-                )
-                WeReadApplication._current_session_manager = session_manager
-
-                # 执行阅读会话
-                session_stats = await session_manager.start_reading_session()
-                all_session_stats.append((user_config.name, session_stats))
-                successful_users.append(user_config.name)
-
-                # 输出单个用户的统计信息
-                logging.info(f"📊 用户 {user_config.name} 会话统计:")
-                logging.info(session_stats.get_statistics_summary())
-
-                # 用户间隔延迟（避免同时请求）
-                if len(instance.config.users) > 1:
-                    user_interval = RandomHelper.get_random_int_from_range(
-                        "30-60"
-                    )
-                    logging.info(
-                        f"⏳ 用户间隔延迟 {user_interval} 秒..."
-                    )
-                    await asyncio.sleep(user_interval)
-
-            except Exception as e:
-                error_msg = (
-                    f"❌ 用户 {user_config.name} 阅读会话执行失败: {e}"
-                )
-                logging.error(error_msg)
-                failed_users.append(user_config.name)
-
-                # 发送单个用户的错误通知
-                try:
-                    notification_service = NotificationService(
-                        instance.config.notification
-                    )
-                    notification_service.send_notification(error_msg)
-                except Exception:
-                    pass
-            finally:
-                WeReadApplication._current_session_manager = None
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            if not result:
+                continue
+            if result["success"] and result["stats"]:
+                all_session_stats.append((result["name"], result["stats"]))
+                successful_users.append(result["name"])
+            else:
+                failed_users.append(result["name"])
 
         # 生成多用户会话总结
-        cls._generate_multi_user_summary(
+        await cls._generate_multi_user_summary(
             instance, all_session_stats, successful_users, failed_users
         )
 
     @classmethod
-    def _generate_multi_user_summary(
+    async def _generate_multi_user_summary(
         cls, instance, all_session_stats, successful_users, failed_users
     ):
         """生成多用户会话总结"""
@@ -2427,7 +2470,7 @@ class WeReadApplication:
                 notification_service = NotificationService(
                     instance.config.notification
                 )
-                notification_service.send_notification(summary)
+                await notification_service.send_notification_async(summary)
             except Exception as e:
                 logging.error(f"❌ 多用户总结通知发送失败: {e}")
 
@@ -2724,86 +2767,89 @@ class WeReadSessionManager:
         logging.info(f"🎯 本次目标阅读时长: {target_minutes} 分钟")
 
         # 刷新cookie
-        if not self._refresh_cookie():
+        if not await self._refresh_cookie():
             raise Exception("Cookie刷新失败，程序终止")
 
         # 开始阅读循环
         target_seconds = target_minutes * 60
         last_time = int(time.time()) - 30
 
-        while self.session_stats.actual_duration_seconds < target_seconds:
-            # 检查是否收到关闭信号
-            if WeReadApplication._shutdown_requested:
-                logging.info("📡 收到关闭信号，结束阅读会话")
-                break
+        try:
+            while self.session_stats.actual_duration_seconds < target_seconds:
+                # 检查是否收到关闭信号
+                if WeReadApplication._shutdown_requested:
+                    logging.info("📡 收到关闭信号，结束阅读会话")
+                    break
 
-            try:
-                # 模拟人类行为：判断是否休息
-                if self.behavior_simulator.should_take_break():
-                    break_duration = (
-                        self.behavior_simulator.get_break_duration()
-                    )
-                    logging.info(f"☕ 休息一下... {break_duration} 秒")
+                try:
+                    # 模拟人类行为：判断是否休息
+                    if self.behavior_simulator.should_take_break():
+                        break_duration = (
+                            self.behavior_simulator.get_break_duration()
+                        )
+                        logging.info(f"☕ 休息一下... {break_duration} 秒")
 
-                    await asyncio.sleep(break_duration)
-                    self.session_stats.breaks_taken += 1
-                    self.session_stats.total_break_time += break_duration
-                    continue
+                        await asyncio.sleep(break_duration)
+                        self.session_stats.breaks_taken += 1
+                        self.session_stats.total_break_time += break_duration
+                        continue
 
-                # 模拟阅读请求
-                success, response_time = (
-                    await self._simulate_reading_request(last_time)
-                )
-
-                if success:
-                    self.session_stats.successful_reads += 1
-                    last_time = int(time.time())
-
-                    # 计算实际阅读时长
-                    current_time = datetime.now()
-                    duration_delta = (
-                        current_time - self.session_stats.start_time
-                    )
-                    self.session_stats.actual_duration_seconds = int(
-                        duration_delta.total_seconds()
+                    # 模拟阅读请求
+                    success, response_time = (
+                        await self._simulate_reading_request(last_time)
                     )
 
-                    progress_minutes = (
-                        self.session_stats.actual_duration_seconds // 60
+                    if success:
+                        self.session_stats.successful_reads += 1
+                        last_time = int(time.time())
+
+                        # 计算实际阅读时长
+                        current_time = datetime.now()
+                        duration_delta = (
+                            current_time - self.session_stats.start_time
+                        )
+                        self.session_stats.actual_duration_seconds = int(
+                            duration_delta.total_seconds()
+                        )
+
+                        progress_minutes = (
+                            self.session_stats.actual_duration_seconds // 60
+                        )
+                        logging.info(
+                            f"✅ 阅读成功，进度: {progress_minutes}分钟 / "
+                            f"{target_minutes}分钟"
+                        )
+                    else:
+                        self.session_stats.failed_reads += 1
+
+                    # 记录响应时间
+                    self.session_stats.response_times.append(response_time)
+
+                    # 获取下次阅读间隔
+                    interval = self.behavior_simulator.get_reading_interval(
+                        self.effective_reading_config.reading_interval
                     )
-                    logging.info(
-                        f"✅ 阅读成功，进度: {progress_minutes}分钟 / "
-                        f"{target_minutes}分钟"
-                    )
-                else:
+                    await asyncio.sleep(interval)
+
+                except Exception as e:
+                    logging.error(f"❌ 阅读请求异常: {e}")
                     self.session_stats.failed_reads += 1
+                    await asyncio.sleep(30)
 
-                # 记录响应时间
-                self.session_stats.response_times.append(response_time)
+            # 完成会话
+            self.session_stats.end_time = datetime.now()
+            logging.info("🎉 阅读任务完成！")
 
-                # 获取下次阅读间隔
-                interval = self.behavior_simulator.get_reading_interval(
-                    self.effective_reading_config.reading_interval
+            # 发送通知
+            if (self.config.notification.enabled and
+                    self.config.notification.include_statistics):
+                await self.notification_service.send_notification_async(
+                    self.session_stats.get_statistics_summary()
                 )
-                await asyncio.sleep(interval)
 
-            except Exception as e:
-                logging.error(f"❌ 阅读请求异常: {e}")
-                self.session_stats.failed_reads += 1
-                await asyncio.sleep(30)
-
-        # 完成会话
-        self.session_stats.end_time = datetime.now()
-        logging.info("🎉 阅读任务完成！")
-
-        # 发送通知
-        if (self.config.notification.enabled and
-                self.config.notification.include_statistics):
-            self.notification_service.send_notification(
-                self.session_stats.get_statistics_summary()
-            )
-
-        return self.session_stats
+            return self.session_stats
+        finally:
+            await self.http_client.close()
 
     async def _simulate_reading_request(self,
                                         last_time: int) -> Tuple[bool, float]:
@@ -2871,7 +2917,7 @@ class WeReadSessionManager:
 
         try:
             # 发送请求
-            response_data, response_time = self.http_client.post_json(
+            response_data, response_time = await self.http_client.post_json(
                 self.READ_URL, self.data, self.headers, self.cookies
             )
 
@@ -2885,7 +2931,7 @@ class WeReadSessionManager:
                     logging.warning(
                         f"❌ 无synckey，尝试修复... 响应: {response_data}"
                     )
-                    self._fix_no_synckey()
+                    await self._fix_no_synckey()
                     return False, response_time
             else:
                 logging.warning(
@@ -2895,57 +2941,61 @@ class WeReadSessionManager:
                     f"🔍 失败的请求数据: book_id={self.data.get('b')}, "
                     f"chapter_id={self.data.get('c')}"
                 )
-                self._refresh_cookie()
+                await self._refresh_cookie()
                 return False, response_time
 
         except Exception as e:
             logging.error(f"❌ 请求失败: {e}")
             return False, 0.0
 
-    def _refresh_cookie(self) -> bool:
+    async def _refresh_cookie(self) -> bool:
         """刷新cookie"""
         logging.info("🍪 刷新cookie...")
 
         try:
-            response = requests.post(
+            response, _ = await self.http_client.post_raw(
                 self.RENEW_URL,
                 headers=self.headers,
                 cookies=self.cookies,
-                data=json.dumps(self.cookie_data, separators=(',', ':')),
-                timeout=30
+                json_data=self.cookie_data
             )
 
-            for cookie in response.headers.get('Set-Cookie', '').split(';'):
-                if "wr_skey" in cookie:
-                    new_skey = cookie.split('=')[-1][:8]
+            new_skey = response.cookies.get("wr_skey")
 
-                    if not new_skey:
-                        logging.error(f"❌ Cookie刷新失败，新密钥为空")
-                        return False
-                    
-                    self.cookies['wr_skey'] = new_skey
-                    logging.info(f"✅ Cookie刷新成功，新密钥: {new_skey}")
-                    return True
+            if not new_skey:
+                # 备用：从Set-Cookie解析
+                set_cookie = response.headers.get("set-cookie", "")
+                for cookie in set_cookie.split(','):
+                    if "wr_skey" in cookie:
+                        parts = cookie.split(';')[0]
+                        if '=' in parts:
+                            new_skey = parts.split('=', 1)[1].strip()
+                            break
+
+            if not new_skey:
+                logging.error("❌ Cookie刷新失败，未找到wr_skey")
+                return False
+
+            self.cookies['wr_skey'] = new_skey
+            logging.info(f"✅ Cookie刷新成功，新密钥: {new_skey[:8]}***")
+            return True
 
         except Exception as e:
             logging.error(f"❌ Cookie刷新失败: {e}")
 
         return False
 
-    def _fix_no_synckey(self):
+    async def _fix_no_synckey(self):
         """修复synckey问题
 
         代码引用: https://github.com/findmover/wxread
         """
         try:
-            requests.post(
+            await self.http_client.post_raw(
                 self.FIX_SYNCKEY_URL,
                 headers=self.headers,
                 cookies=self.cookies,
-                data=json.dumps(
-                    {"bookIds": ["3300060341"]}, separators=(',', ':')
-                ),
-                timeout=30
+                json_data={"bookIds": ["3300060341"]}
             )
         except Exception as e:
             logging.error(f"❌ 修复synckey失败: {e}")
@@ -3246,7 +3296,7 @@ async def main():
             notification_service = NotificationService(
                 config_manager.config.notification
             )
-            notification_service.send_notification(error_msg)
+            await notification_service.send_notification_async(error_msg)
         except Exception:
             pass
 
@@ -3260,9 +3310,9 @@ if __name__ == "__main__":
         missing_deps.append("PyYAML")
 
     try:
-        import schedule  # noqa: F401,F811
+        from croniter import croniter  # noqa: F401,F811
     except ImportError:
-        missing_deps.append("schedule")
+        missing_deps.append("croniter")
 
     if missing_deps:
         print(f"❌ 缺少依赖: {', '.join(missing_deps)}")

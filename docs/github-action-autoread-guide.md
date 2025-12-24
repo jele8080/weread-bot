@@ -27,6 +27,28 @@ Fork 完成后，需要在你的仓库中配置必要的环境变量：
 |------------|------|----------|
 | `WEREAD_CURL_STRING` | 微信读书的 cURL 请求字符串 | 参考主文档的"获取 cURL 字符串"章节 |
 
+#### 多用户
+
+- 将多个 cURL 片段写入同一个 `WEREAD_CURL_STRING`，**片段之间至少插入两个空行**，程序会自动拆分为多个用户。
+- 通过 `MAX_CONCURRENT_USERS` 控制并发执行账号数量，默认 1 表示顺序执行，建议从 1 开始再逐步提高。
+- 单个片段只绑定一个账号的 cURL，确保不同用户分段清晰，避免粘连。
+
+示例（Secret 内容，注意两空行分隔）：
+
+```
+curl 'https://weread.qq.com/web/book/read' -H 'cookie: wr_skey=user1; ...' --data-raw '{...}'
+
+
+curl 'https://weread.qq.com/web/book/read' -H 'cookie: wr_skey=user2; ...' --data-raw '{...}'
+```
+
+#### 可选运行配置
+
+| Secret 名称 | 说明 | 默认值 |
+|------------|------|------|
+| `MAX_CONCURRENT_USERS` | 多用户并发数量（>=1） | 1 |
+| `HACK_COOKIE_REFRESH_QL` | Cookie 刷新兼容开关，遇到刷新失败可切换 true/false | false |
+
 #### 可选通知配置
 
 根据你使用的通知方式，添加相应的 Secret：
